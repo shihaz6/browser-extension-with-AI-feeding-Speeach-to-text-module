@@ -13,6 +13,38 @@
   cursor: pointer;
 }
 .voice-pos-mic:hover { background: #0e7490; }
+.voice-pos-test-add {
+  position: fixed;
+  right: 190px;
+  bottom: 24px;
+  z-index: 2147483000;
+  border: 0;
+  border-radius: 8px;
+  padding: 13px 18px;
+  background: #f59e0b;
+  color: #111827;
+  box-shadow: 0 4px 16px #0004;
+  font: 700 14px/1.2 system-ui, sans-serif;
+  cursor: pointer;
+}
+.voice-pos-test-add:hover { background: #fbbf24; }
+.voice-pos-test-add:disabled { opacity: .7; cursor: wait; }
+.voice-pos-test-add:focus-visible { outline: 3px solid #f97316; outline-offset: 2px; }
+.voice-pos-live-transcript {
+  position: fixed;
+  right: 24px;
+  bottom: 76px;
+  z-index: 2147483000;
+  max-width: min(520px, calc(100vw - 48px));
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: #0f172a;
+  color: #fff;
+  box-shadow: 0 3px 12px #0004;
+  font: 500 13px/1.4 system-ui, sans-serif;
+  pointer-events: none;
+}
+.voice-pos-live-transcript[hidden] { display: none; }
 .voice-pos-mic:focus-visible, .voice-pos-dialog button:focus-visible { outline: 3px solid #38bdf8; outline-offset: 2px; }
 .voice-pos-mic.voice-pos-listening { background: #b91c1c; }
 .voice-pos-overlay {
