@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Voice POS Order Entry (MVP)",
+  "version": "0.1.0",
+  "description": "Dictate products into a POS order and review them before entry.",
+  "permissions": [],
+  "host_permissions": ["https://YOUR-POS-DOMAIN.example/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://YOUR-POS-DOMAIN.example/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
