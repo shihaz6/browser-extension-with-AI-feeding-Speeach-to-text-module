@@ -4,14 +4,14 @@
   "version": "0.1.0",
   "description": "Dictate products into a POS order and review them before entry.",
   "permissions": [],
-  "host_permissions": ["http://*/*", "https://*/*"],
+  "host_permissions": ["http://*/*", "https://*/*", "http://localhost:3001/*"],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content.js"],
+      "js": ["product-identity.js", "phonetic.js", "content.js"],
       "css": ["styles.css"],
       "run_at": "document_idle"
     }
