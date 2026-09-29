@@ -48,6 +48,27 @@ test("Losacar exact name matching continues to work", () => {
   assert.equal(result.phoneticMatch, true);
 });
 
+test("medicine phonetic key handles common final-sound and consonant shifts generically", () => {
+  assert.equal(voicePOS.medicinePhoneticKey("Losacar"), "losaka");
+  assert.equal(voicePOS.medicinePhoneticKey("Atorva"), "atorwa");
+  assert.equal(voicePOS.medicinePhoneticSimilarity("losaka", "Losacar"), 1);
+  assert.ok(voicePOS.medicinePhoneticSimilarity("atowa", "Atorva") >= 0.8);
+});
+
+test("Losaka-style transcription can retrieve Losacar when strength matches", () => {
+  const result = voicePOS.findBestProductMatch("losaka 50", ["Losacar 50mg", "Panadol 500mg"]);
+  assert.equal(result.product, "Losacar 50mg");
+  assert.equal(result.strengthMatch, true);
+  assert.ok(result.nameSimilarity >= voicePOS.CONFIG.minimumNameSimilarity);
+});
+
+test("medicine phonetic matching does not override wrong strength", () => {
+  const result = voicePOS.findBestProductMatch("losaka 25", ["Losacar 50mg"]);
+  assert.equal(result.product, "Losacar 50mg");
+  assert.equal(result.strengthMatch, false);
+  assert.equal(result.confident, false);
+});
+
 test("an unrelated medicine with the same strength is rejected", () => {
   const result = voicePOS.findBestProductMatch("losacar 500mg", ["Panadol 500mg"]);
   assert.equal(result.strengthMatch, true);
@@ -82,6 +103,20 @@ test('decimal strengths survive quantity-first parsing', () => {
   const [item] = voicePOS.parseOrder('10 Sample 2.5mg.');
   assert.equal(item.quantity, 10);
   assert.equal(item.product, 'sample 2.5mg');
+});
+
+test('comma-separated STT transcript remains one quantity-first order', () => {
+  const [item] = voicePOS.parseOrder('10, Losaka, 50.');
+  assert.equal(item.quantity, 10);
+  assert.equal(item.product, 'losaka 50');
+  assert.equal(item.needsCorrection, false);
+});
+
+test('plural tens STT token is accepted as quantity ten', () => {
+  const [item] = voicePOS.parseOrder('Tens, Losaka, 50.');
+  assert.equal(item.quantity, 10);
+  assert.equal(item.product, 'losaka 50');
+  assert.equal(item.needsCorrection, false);
 });
 
 for (const [query, candidate] of [

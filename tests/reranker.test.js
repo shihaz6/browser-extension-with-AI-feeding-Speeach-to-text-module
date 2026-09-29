@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { rerank } = require('../server/providers/groq-rerank');
+const { rerank, resolveSelection } = require('../server/providers/groq-rerank');
 const { evaluateRerank } = require('../server/rerank-service');
 const input = {
   transcript: '10 atova 20mg', quantity: 10, namePart: 'atova', strength: '20mg',
@@ -25,6 +25,42 @@ test('valid closed-choice answer is returned with completion diagnostics', async
   assert.equal(result.status, 'ok');
   assert.equal(result.finishReason, 'stop');
   assert.equal(result.completionTokens, 36);
+});
+test('prompt frames reranking as pharmacy catalog-only medicine resolution', async () => {
+  const seen = {};
+  await rerank(input, { ...options('1'), fetchImpl: async (_url, request) => {
+    Object.assign(seen, JSON.parse(request.body));
+    return new Response(JSON.stringify({ choices: [{ message: { content: '1' }, finish_reason: 'stop' }], usage: { completion_tokens: 12 } }));
+  } });
+  const prompt = seen.messages.map(message => message.content).join('\n');
+  assert.match(prompt, /pharmacy product-name resolver/i);
+  assert.match(prompt, /medicine\/pharmacy products/i);
+  assert.match(prompt, /Apply medicine-name phonetic reasoning to every provided candidate/i);
+  assert.match(prompt, /final sounds dropped or changed/i);
+  assert.match(prompt, /c\/k\/q sounds interchanged/i);
+  assert.match(prompt, /v\/w sounds interchanged/i);
+  assert.match(prompt, /"losaka", "los aguas", or similar may refer to "Losacar"/i);
+  assert.match(prompt, /ONLY products you may choose from/i);
+  assert.match(prompt, /Do NOT invent another medicine/i);
+  assert.match(prompt, /OPTION_INDEX=1 \| PRODUCT_NAME=Atorva 20mg \| POS_CODE=101/i);
+  assert.match(prompt, /Do NOT return the POS_CODE/i);
+  assert.match(prompt, /Return ONLY the OPTION_INDEX, or 0/i);
+});
+test('exact candidate code can be resolved back to its candidate index', async () => {
+  const result = await rerank(input, options('101'));
+  assert.equal(result.selectedIndex, 1);
+  assert.equal(result.status, 'ok');
+  assert.equal(result.selectedBy, 'code');
+});
+test('candidate code selection must uniquely match a provided candidate', () => {
+  assert.deepEqual(resolveSelection('23799', [
+    { index: 1, code: '23799', name: 'Losacar 50mg' },
+    { index: 2, code: '555', name: 'Losacar 25mg' }
+  ]), { selectedIndex: 1, valid: true, selectedBy: 'code' });
+  assert.deepEqual(resolveSelection('23799', [
+    { index: 1, code: '23799', name: 'Losacar 50mg' },
+    { index: 2, code: '23799', name: 'Different duplicate code' }
+  ]), { selectedIndex: 0, valid: false, selectedBy: 'invalid' });
 });
 for (const answer of ['Candidate 1', 'I think 1', 'Atorva', '3', '-1', '01', '', null]) {
   test(`rejects malformed or out-of-range answer ${JSON.stringify(answer)}`, async () => {
