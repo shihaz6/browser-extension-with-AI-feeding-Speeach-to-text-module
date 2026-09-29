@@ -33,6 +33,14 @@ console.log("[VoicePOS] content script loaded");
     searchResultsTimeout: 3000,
     searchSettleMs: 350,
     searchMinimumWaitMs: 500,
+    catalogMinEmptyWaitMs: 3500,
+    catalogSearchTimeout: 6000,
+    catalogSettleMs: 600,
+    catalogMinPrefixLength: 2,
+    catalogThrottleMinMs: 400,
+    catalogThrottleMaxMs: 600,
+    catalogMaxPrefixDepth: 4,
+    catalogRerankMaxCandidates: 8,
     rerankTimeoutMs: 10000,
     stageTimeout: 6000
   };
@@ -43,6 +51,7 @@ console.log("[VoicePOS] content script loaded");
   let recordedChunks = [];
   let microphoneRequestPending = false;
   let lastRecordingUrl = null;
+  let catalogHarvestRun = null;
 
   function log(...args) { console.info(LOG, ...args); }
   function warn(...args) { console.warn(LOG, ...args); }
@@ -155,10 +164,71 @@ console.log("[VoicePOS] content script loaded");
     };
   }
 
+  function enrichCatalogItem(candidate, discoveredFromPrefix = candidate.discoveredFromQuery || "") {
+    const parsed = extractSearchParts(candidate.name || "");
+    return {
+      code: String(candidate.code || "").trim(),
+      name: String(candidate.name || "").trim(),
+      price: String(candidate.price || "").trim(),
+      normalizedName: normalizeProductName(candidate.name || ""),
+      strength: parsed.strength || "",
+      discoveredFromPrefix
+    };
+  }
+
+  function catalogItemKey(item) {
+    return item.code ? `code:${item.code}` : `name:${item.normalizedName}|strength:${item.strength}`;
+  }
+
+  function getCatalog(callback) {
+    if (!globalThis.chrome?.storage?.local) return callback({ harvestedAt: "", items: [] });
+    chrome.storage.local.get({ catalog: { harvestedAt: "", items: [] } }, result => {
+      const catalog = result?.catalog && Array.isArray(result.catalog.items)
+        ? result.catalog
+        : { harvestedAt: "", items: [] };
+      callback(catalog);
+    });
+  }
+
+  function getCatalogAsync() {
+    return new Promise(resolve => getCatalog(resolve));
+  }
+
+  function saveCatalog(catalog, callback = () => {}) {
+    const payload = {
+      harvestedAt: catalog.harvestedAt || new Date().toISOString(),
+      items: Array.isArray(catalog.items) ? catalog.items : []
+    };
+    if (!globalThis.chrome?.storage?.local) return callback(payload);
+    chrome.storage.local.set({ catalog: payload }, () => callback(payload));
+  }
+
+  function upsertCatalogItems(candidates, options = {}) {
+    const items = candidates
+      .map(candidate => enrichCatalogItem(candidate, options.discoveredFromPrefix))
+      .filter(item => item.code && item.name);
+    if (!items.length) return Promise.resolve({ inserted: 0, updated: 0, catalog: null });
+    return new Promise(resolve => {
+      getCatalog(catalog => {
+        const byKey = new Map((catalog.items || []).map(item => [catalogItemKey(item), item]));
+        let inserted = 0;
+        let updated = 0;
+        for (const item of items) {
+          const key = catalogItemKey(item);
+          if (byKey.has(key)) updated += 1;
+          else inserted += 1;
+          byKey.set(key, { ...byKey.get(key), ...item });
+        }
+        const next = { harvestedAt: new Date().toISOString(), items: [...byKey.values()] };
+        saveCatalog(next, saved => resolve({ inserted, updated, catalog: saved }));
+      });
+    });
+  }
+
   function parseOrder(text) {
-    const numberWords = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+    const numberWords = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, tens: 10 };
     let normalized = String(text ?? "").toLowerCase().trim()
-      .replace(/,\s*(?=(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b)/g, " | ")
+      .replace(/,\s*(?=(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|tens)\b\s+[a-z])/g, " | ")
       .replace(/,/g, " ")
       .replace(/\b(and|then)\b/g, " | ");
 
@@ -227,6 +297,31 @@ console.log("[VoicePOS] content script loaded");
     return queryCodes.some(queryCode => queryCode && candidateCodes.some(candidateCode => candidateCode && queryCode === candidateCode));
   }
 
+  function medicinePhoneticKey(text) {
+    return normalizePhoneticName(text)
+      .replace(/c(?=[aou])/g, "k")
+      .replace(/q/g, "k")
+      .replace(/x/g, "ks")
+      .replace(/ph/g, "f")
+      .replace(/v/g, "w")
+      .replace(/(.)\1+/g, "$1")
+      .split(" ")
+      .map(word => word.length > 4 ? word.replace(/ar$/, "a").replace(/er$/, "a").replace(/or$/, "a").replace(/r$/, "") : word)
+      .join(" ");
+  }
+
+  function medicinePhoneticSimilarity(left, right) {
+    const leftKey = medicinePhoneticKey(left).replace(/\s+/g, "");
+    const rightKey = medicinePhoneticKey(right).replace(/\s+/g, "");
+    if (!leftKey || !rightKey) return 0;
+    if (leftKey === rightKey) return 1;
+    const edit = 1 - levenshteinDistance(leftKey, rightKey) / Math.max(leftKey.length, rightKey.length, 1);
+    let prefixLength = 0;
+    while (prefixLength < Math.min(leftKey.length, rightKey.length) && leftKey[prefixLength] === rightKey[prefixLength]) prefixLength++;
+    const prefix = prefixLength / Math.max(leftKey.length, rightKey.length, 1);
+    return Math.max(edit, prefix);
+  }
+
   function findBestProductMatch(name, products) {
     const query = extractSearchParts(name);
     const normalized = normalizeProductName(query.full);
@@ -275,20 +370,25 @@ console.log("[VoicePOS] content script loaded");
       const rawNameSimilarity = Math.max(0, rawNameScore - variantPenalty);
       const queryName = aliasedQuery.words.join(" ");
       const candidateName = candidateWords.join(" ");
+      const medicinePhoneticNameSimilarity = medicinePhoneticSimilarity(queryName, candidateName);
+      const medicinePhoneticAdjustedSimilarity = rawNameSimilarity >= CONFIG.highConfidenceNameThreshold
+        ? rawNameSimilarity
+        : Math.max(rawNameSimilarity, Math.min(CONFIG.highConfidenceNameThreshold - 0.001, medicinePhoneticNameSimilarity));
       const queryPhoneticCodes = getPhoneticCodes(queryName);
       const candidatePhoneticCodes = getPhoneticCodes(candidateName);
       const phoneticMatch = phoneticCodesMatch(queryPhoneticCodes, candidatePhoneticCodes);
       const phoneticBonusApplied = phoneticMatch &&
-        rawNameSimilarity >= CONFIG.phoneticMinStringSimilarity &&
-        rawNameSimilarity < CONFIG.highConfidenceNameThreshold;
+        medicinePhoneticAdjustedSimilarity >= CONFIG.phoneticMinStringSimilarity &&
+        medicinePhoneticAdjustedSimilarity < CONFIG.highConfidenceNameThreshold;
       const effectiveNameSimilarity = phoneticBonusApplied
-        ? Math.max(rawNameSimilarity, Math.min(CONFIG.highConfidenceNameThreshold - 0.001, 1 - CONFIG.ambiguityMargin - 0.001,
-          rawNameSimilarity + CONFIG.phoneticBonus))
-        : rawNameSimilarity;
+        ? Math.max(medicinePhoneticAdjustedSimilarity, Math.min(CONFIG.highConfidenceNameThreshold - 0.001, 1 - CONFIG.ambiguityMargin - 0.001,
+          medicinePhoneticAdjustedSimilarity + CONFIG.phoneticBonus))
+        : medicinePhoneticAdjustedSimilarity;
       const strengthMatch = globalThis.VoicePOSProductIdentity.strengthMatches(aliasedQuery.full, candidateFull);
       // Strength is a filter only; it never adds to the medicine-name score.
       return {
         rawNameSimilarity,
+        medicinePhoneticNameSimilarity,
         exactNameMatch: queryName === candidateName,
         effectiveNameSimilarity,
         queryPhoneticCodes,
@@ -307,7 +407,7 @@ console.log("[VoicePOS] content script loaded");
       if (!label) continue;
       scored.push({ product, ...scoreCandidate(label) });
     }
-    scored.sort((a, b) => b.score - a.score);
+    scored.sort((a, b) => b.score - a.score || Number(b.exactNameMatch) - Number(a.exactNameMatch));
     if (!scored.length) return null;
     const strengthCompatible = scored.filter(item => item.strengthMatch);
     const best = strengthCompatible[0] || scored[0];
@@ -445,11 +545,341 @@ console.log("[VoicePOS] content script loaded");
       }
       const fresh = cleared || currentSignature !== previousSignature;
       if (cards.length && fresh && Date.now() - started >= CONFIG.searchMinimumWaitMs &&
-          Date.now() - changedAt >= CONFIG.searchSettleMs) return cards;
+          Date.now() - changedAt >= CONFIG.searchSettleMs) {
+        void upsertCatalogItems(cards, { discoveredFromPrefix: query }).catch(error => warn("Catalog upsert failed:", error));
+        return cards;
+      }
       await new Promise(resolve => setTimeout(resolve, 50));
     }
     if (!getVisibleProductCards().length) return [];
     throw new Error(`POS search results did not refresh or settle for "${query}". Product selection stopped.`);
+  }
+
+  function productCardSignature(cards) {
+    return cards.map(card => String(card.code || card.normalizedName || card.name)).filter(Boolean).sort().join("\n");
+  }
+
+  function waitForDomSettle(timeout = CONFIG.catalogSearchTimeout, quietMs = 400) {
+    return new Promise(resolve => {
+      let lastMutation = Date.now();
+      const observer = new MutationObserver(() => { lastMutation = Date.now(); });
+      observer.observe(document.body || document.documentElement, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true
+      });
+      const started = Date.now();
+      const poll = () => {
+        if (Date.now() - lastMutation >= quietMs || Date.now() - started >= timeout) {
+          observer.disconnect();
+          resolve();
+          return;
+        }
+        setTimeout(poll, 50);
+      };
+      poll();
+    });
+  }
+
+  async function catalogSearchProductCards(search, prefix, previousAcceptedSignature = "") {
+    const started = Date.now();
+    const originalTimeout = CONFIG.searchResultsTimeout;
+    const originalSettle = CONFIG.searchSettleMs;
+    CONFIG.searchResultsTimeout = CONFIG.catalogSearchTimeout;
+    CONFIG.searchSettleMs = CONFIG.catalogSettleMs;
+    let cards = [];
+    try {
+      cards = await searchProductCards(search, prefix);
+    } finally {
+      CONFIG.searchResultsTimeout = originalTimeout;
+      CONFIG.searchSettleMs = originalSettle;
+    }
+
+    if (!cards.length && Date.now() - started < CONFIG.catalogMinEmptyWaitMs) {
+      await new Promise(resolve => setTimeout(resolve, CONFIG.catalogMinEmptyWaitMs - (Date.now() - started)));
+      cards = getVisibleProductCards(prefix);
+    }
+    if (!cards.length && Date.now() - started < CONFIG.catalogSearchTimeout) {
+      await waitForDomSettle(CONFIG.catalogSearchTimeout - (Date.now() - started), CONFIG.catalogSettleMs);
+      cards = getVisibleProductCards(prefix);
+    }
+
+    if (cards.length) await waitForDomSettle(1200, CONFIG.catalogSettleMs);
+    cards = getVisibleProductCards(prefix);
+    let signature = productCardSignature(cards);
+    if (prefix && previousAcceptedSignature && signature && signature === previousAcceptedSignature) {
+      await waitForDomSettle(1200, CONFIG.catalogSettleMs);
+      cards = getVisibleProductCards(prefix);
+      signature = productCardSignature(cards);
+    }
+
+    const diagnostics = getCatalogSearchDiagnostics(search, cards);
+    return {
+      cards,
+      signature,
+      waitedMs: Date.now() - started,
+      containerOuterHtmlLength: diagnostics.containerOuterHtmlLength,
+      state: diagnostics.state
+    };
+  }
+
+  function getCatalogSearchDiagnostics(search, cards = []) {
+    const container = getCatalogResultsContainer(search, cards);
+    const text = normalizeProductName(container?.innerText || container?.textContent || "");
+    const loading = /\b(?:loading|searching|please wait|wait)\b/.test(text);
+    const noResults = /\b(?:no result|no results|not found|no item|no items|empty)\b/.test(text);
+    return {
+      containerOuterHtmlLength: String(container?.outerHTML || "").length,
+      state: loading ? "loading" : noResults ? "no-results" : "none"
+    };
+  }
+
+  function getCatalogResultsContainer(search, cards = []) {
+    const firstCardElement = cards.find(card => card.element)?.element || document.querySelector(CONFIG.productCards);
+    if (firstCardElement?.parentElement) return firstCardElement.parentElement;
+    return search?.closest("form, section, main, div") || document.body || document.documentElement;
+  }
+
+  function getCartHasItems() {
+    if (!CONFIG.billRows) return false;
+    const roots = [...document.querySelectorAll(CONFIG.billRows)].filter(isVisible);
+    const candidates = roots.flatMap(root => {
+      const visibleChildren = [...root.querySelectorAll("tr, li, div")]
+        .filter(el => isVisible(el) && String(el.innerText || el.textContent || "").trim());
+      return visibleChildren.length ? visibleChildren : [root];
+    });
+    return candidates.some(element => isLikelyBillLineText(element.innerText || element.textContent || ""));
+  }
+
+  function isLikelyBillLineText(text) {
+    const normalized = normalizeProductName(text);
+    if (!normalized) return false;
+    const withoutUiLabels = normalized
+      .replace(/\b(?:item|items|product|products|name|code|qty|quantity|price|amount|discount|total|subtotal|net|balance|cash|card|payment|invoice|bill|cart|empty|no items?)\b/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!/[a-z]/.test(withoutUiLabels)) return false;
+    const numbers = String(text).match(/\d+(?:[.,]\d+)?/g) || [];
+    return numbers.length >= 1;
+  }
+
+  function catalogSeedPrefixes() {
+    const letters = "abcdefghijklmnopqrstuvwxyz".split("");
+    const minLength = Math.max(1, Number(CONFIG.catalogMinPrefixLength) || 2);
+    let prefixes = [""];
+    for (let depth = 0; depth < minLength; depth++) {
+      prefixes = prefixes.flatMap(prefix => letters.map(letter => `${prefix}${letter}`));
+    }
+    return prefixes;
+  }
+
+  function catalogChildPrefixes(prefix) {
+    return "abcdefghijklmnopqrstuvwxyz0123456789".split("").map(suffix => `${prefix}${suffix}`);
+  }
+
+  function randomCatalogItems(items, count = 10) {
+    const pool = [...items];
+    for (let index = pool.length - 1; index > 0; index--) {
+      const swap = Math.floor(Math.random() * (index + 1));
+      [pool[index], pool[swap]] = [pool[swap], pool[index]];
+    }
+    return pool.slice(0, count);
+  }
+
+  function renderCatalogReport(report) {
+    const panel = document.querySelector(".voice-pos-catalog-panel");
+    if (!panel) return;
+    panel.querySelector(".voice-pos-catalog-report")?.remove();
+    const section = document.createElement("section");
+    section.className = "voice-pos-catalog-report";
+    const summary = document.createElement("p");
+    summary.textContent = `Catalog: ${report.totalItems} items. Duplicates dropped: ${report.duplicatesDropped}. No strength: ${report.noStrengthCount}. Failed prefixes: ${report.failedPrefixes.length}. Zero-item prefixes: ${report.zeroItemQueries.length}. Capped at depth ${CONFIG.catalogMaxPrefixDepth}: ${report.cappedPrefixes.length}.`;
+    const sample = document.createElement("pre");
+    const zeroLines = report.zeroItemQueries.slice(0, 20)
+      .map(item => `0 items | ${item.prefix} | ${item.waitedMs}ms | ${item.state}`)
+      .join("\n");
+    const sampleLines = report.sampleItems
+      .map(item => `${item.code || "(no code)"} | ${item.name} | ${item.strength || "(no strength)"} | ${item.price || "(no price)"}`)
+      .join("\n");
+    sample.textContent = [zeroLines, sampleLines || "No catalog items found."].filter(Boolean).join("\n\n");
+    section.append(summary, sample);
+    panel.append(section);
+  }
+
+  async function buildCatalog() {
+    if (catalogHarvestRun?.active) return;
+    const status = document.querySelector(".voice-pos-catalog-status");
+    const buildButton = document.querySelector(".voice-pos-catalog-build");
+    const stopButton = document.querySelector(".voice-pos-catalog-stop");
+    if (getCartHasItems()) {
+      if (status) status.textContent = "Catalog build refused: cart/bill has items. Clear the cart first.";
+      return;
+    }
+    const search = await waitForElement(CONFIG.searchInput, { timeout: CONFIG.stageTimeout });
+    const run = { active: true, stop: false };
+    catalogHarvestRun = run;
+    if (buildButton) buildButton.disabled = true;
+    if (stopButton) stopButton.disabled = false;
+
+    const queue = catalogSeedPrefixes();
+    const seenPrefixes = new Set(queue);
+    const itemsByCode = new Map();
+    const failedPrefixes = [];
+    const cappedPrefixes = [];
+    const zeroItemQueries = [];
+    let observedCap = 0;
+    let queriesDone = 0;
+    let duplicatesDropped = 0;
+    let previousSignature = "";
+    let sanityStopMessage = "";
+    const updateProgress = () => {
+      if (status) status.textContent = `Building catalog: ${queriesDone} done / ${queue.length} queued / ${itemsByCode.size} items found`;
+    };
+
+    try {
+      while (queue.length && !run.stop) {
+        const prefix = queue.shift();
+        updateProgress();
+        const throttle = CONFIG.catalogThrottleMinMs + Math.floor(Math.random() * (CONFIG.catalogThrottleMaxMs - CONFIG.catalogThrottleMinMs + 1));
+        await new Promise(resolve => setTimeout(resolve, throttle));
+
+        let result = null;
+        for (let attempt = 0; attempt < 2 && !result; attempt++) {
+          try {
+            result = await catalogSearchProductCards(search, prefix, previousSignature);
+          } catch (error) {
+            warn(`Catalog prefix "${prefix}" attempt ${attempt + 1} failed:`, error);
+            if (attempt === 1) failedPrefixes.push(prefix);
+          }
+        }
+        queriesDone += 1;
+        if (!result) {
+          updateProgress();
+          continue;
+        }
+        if (queriesDone <= 5) {
+          log("[VoicePOS] Catalog debug", {
+            prefix,
+            waitedMs: result.waitedMs,
+            cardsFound: result.cards.length,
+            containerOuterHtmlLength: result.containerOuterHtmlLength,
+            state: result.state
+          });
+        }
+        if (!result.cards.length) {
+          zeroItemQueries.push({
+            prefix,
+            waitedMs: result.waitedMs,
+            state: result.state,
+            containerOuterHtmlLength: result.containerOuterHtmlLength
+          });
+        }
+        if (queriesDone === 10 && itemsByCode.size === 0 && zeroItemQueries.length === 10) {
+          const message = "POS returned nothing for the first 10 searches. Check wait time / minimum length.";
+          sanityStopMessage = message;
+          if (status) status.textContent = message;
+          warn(message, zeroItemQueries);
+          break;
+        }
+
+        previousSignature = result.signature;
+        const enriched = result.cards
+          .map(card => enrichCatalogItem(card, prefix))
+          .filter(item => item.code && item.name);
+        for (const item of enriched) {
+          if (itemsByCode.has(item.code)) duplicatesDropped += 1;
+          itemsByCode.set(item.code, item);
+        }
+
+        const resultCount = result.cards.length;
+        observedCap = Math.max(observedCap, resultCount);
+        const looksCapped = observedCap > 0 && resultCount >= observedCap;
+        if (looksCapped) {
+          if (prefix.length >= CONFIG.catalogMaxPrefixDepth) cappedPrefixes.push(prefix);
+          else {
+            for (const child of catalogChildPrefixes(prefix)) {
+              if (!seenPrefixes.has(child)) {
+                seenPrefixes.add(child);
+                queue.push(child);
+              }
+            }
+          }
+        }
+        updateProgress();
+      }
+
+      const items = [...itemsByCode.values()].sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true }));
+      const report = {
+        totalItems: items.length,
+        duplicatesDropped,
+        noStrengthCount: items.filter(item => !item.strength).length,
+        failedPrefixes,
+        cappedPrefixes,
+        zeroItemQueries,
+        sampleItems: randomCatalogItems(items, 10)
+      };
+      await new Promise(resolve => saveCatalog({ harvestedAt: new Date().toISOString(), items }, resolve));
+      renderCatalogReport(report);
+      if (status) status.textContent = sanityStopMessage || (run.stop
+        ? `Catalog build stopped: ${queriesDone} done / ${queue.length} queued / ${items.length} items found`
+        : `Catalog build complete: ${queriesDone} done / ${items.length} items found`);
+      log("[VoicePOS] Catalog report", report);
+    } finally {
+      run.active = false;
+      if (catalogHarvestRun === run) catalogHarvestRun = null;
+      if (buildButton) buildButton.disabled = false;
+      if (stopButton) stopButton.disabled = true;
+    }
+  }
+
+  function stopCatalogBuild() {
+    if (catalogHarvestRun) catalogHarvestRun.stop = true;
+    const status = document.querySelector(".voice-pos-catalog-status");
+    if (status) status.textContent = "Stopping catalog build after the current prefix...";
+  }
+
+  function downloadCatalog() {
+    getCatalog(catalog => {
+      const blob = new Blob([JSON.stringify(catalog, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "catalog.json";
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+  }
+
+  function importCatalogFile(file) {
+    const status = document.querySelector(".voice-pos-catalog-status");
+    if (!file) return;
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      try {
+        const parsed = JSON.parse(String(reader.result || "{}"));
+        if (!parsed || !Array.isArray(parsed.items)) throw new Error("Expected { harvestedAt, items[] }");
+        const items = parsed.items
+          .map(item => ({
+            ...enrichCatalogItem({
+            code: item.code,
+            name: item.name,
+            price: item.price,
+            discoveredFromQuery: item.discoveredFromPrefix
+            }, item.discoveredFromPrefix || "import"),
+            strength: String(item.strength || enrichCatalogItem(item).strength || ""),
+            normalizedName: String(item.normalizedName || normalizeProductName(item.name || "")),
+            discoveredFromPrefix: String(item.discoveredFromPrefix || "import")
+          }))
+          .filter(item => item.code && item.name);
+        saveCatalog({ harvestedAt: parsed.harvestedAt || new Date().toISOString(), items }, () => {
+          if (status) status.textContent = `Imported catalog: ${items.length} items`;
+        });
+      } catch (error) {
+        if (status) status.textContent = `Import failed: ${error.message || error}`;
+      }
+    }, { once: true });
+    reader.readAsText(file);
   }
 
   function canStopDiscovery(match) {
@@ -796,6 +1226,118 @@ console.log("[VoicePOS] content script loaded");
     return !!candidate && globalThis.VoicePOSProductIdentity.strengthMatches(productName, candidate.name);
   }
 
+  function uniqueScoredCatalogCandidates(scoredCandidates) {
+    const unique = new Map();
+    for (const scored of scoredCandidates || []) {
+      const product = scored?.product;
+      if (!product?.name) continue;
+      const key = productIdentityKey(product);
+      const existing = unique.get(key);
+      if (!existing || scored.score > existing.score) unique.set(key, scored);
+    }
+    return [...unique.values()].sort((a, b) => b.score - a.score);
+  }
+
+  function topCatalogProductsForRerank(match, productName) {
+    const scored = uniqueScoredCatalogCandidates(match?.candidates || []);
+    const strengthCompatible = scored.filter(candidate => candidateMatchesStrength(candidate.product, productName));
+    const fallback = scored.filter(candidate => !strengthCompatible.includes(candidate));
+    return [...strengthCompatible, ...fallback]
+      .slice(0, CONFIG.catalogRerankMaxCandidates)
+      .map(candidate => candidate.product);
+  }
+
+  function matchCatalogProduct(productName, catalogItems) {
+    const candidates = catalogItems
+      .filter(item => item?.code && item?.name)
+      .map(item => ({
+        code: String(item.code),
+        name: String(item.name),
+        price: String(item.price || ""),
+        normalizedName: item.normalizedName || normalizeCandidateProduct(item.name),
+        discoveredFromQuery: item.discoveredFromPrefix || "catalog"
+      }));
+    const directMatch = findBestProductMatch(productName, candidates);
+    const attempts = directMatch ? [{ queryVariant: productName, match: directMatch }] : [];
+    let bestMatch = directMatch;
+    const mergeParts = getMergeQueryParts(productName);
+    for (const variant of generateNameMergeVariants(mergeParts.namePart)) {
+      const mergedQuery = normalizeSearchQuery(`${variant} ${mergeParts.strength}`).trim();
+      if (!mergedQuery || attempts.some(attempt => attempt.queryVariant === mergedQuery)) continue;
+      const match = findBestProductMatch(mergedQuery, candidates);
+      if (match) attempts.push({ queryVariant: mergedQuery, match });
+    }
+    const mergedMatch = attempts.length ? mergeScoringAttempts(attempts) : null;
+    if (mergedMatch?.product && (!bestMatch?.product || mergedMatch.score > bestMatch.score || mergedMatch.confident)) bestMatch = mergedMatch;
+    return { match: bestMatch, candidates };
+  }
+
+  async function resolveVoiceProductFromCatalog({ transcript, productName, quantity }) {
+    const catalog = await getCatalogAsync();
+    const items = Array.isArray(catalog.items) ? catalog.items : [];
+    if (!items.length) throw new Error("Local catalog is empty. Build or import catalog.json before using voice orders.");
+    const { match } = matchCatalogProduct(productName, items);
+    if (match?.product) {
+      log(`[VoicePOS] Catalog deterministic result: ${match.product.name} (${Number(match.score).toFixed(2)})`);
+    } else log("[VoicePOS] Catalog deterministic result: candidate none found");
+    for (const candidate of match?.candidates?.slice(0, CONFIG.catalogRerankMaxCandidates) || []) logScoredCandidate(candidate);
+    const rerankCandidates = topCatalogProductsForRerank(match, productName);
+    if (!rerankCandidates.length) throw new Error(`No local catalog candidates matched “${normalizeSearchQuery(productName)}”.`);
+    return rerankCatalogCandidates({ transcript, quantity, productName, candidates: rerankCandidates });
+  }
+
+  async function rerankCatalogCandidates({ transcript, quantity, productName, candidates }) {
+    const parsed = extractSearchParts(productName);
+    const requestCandidates = candidates.map((candidate, index) => ({
+      index: index + 1,
+      code: candidate.code || "",
+      name: candidate.name,
+      strength: productStrength(candidate.name),
+      candidate
+    }));
+    log(`[VoicePOS] Sending ${requestCandidates.length} local catalog candidates to LLM reranker`);
+    log("[VoicePOS] LLM transcript input:", transcript);
+    log("[VoicePOS] LLM candidates:", requestCandidates.map(({ index, code, name, strength }) => ({ index, code, name, strength })));
+    const statusElement = document.querySelector(".voice-pos-recording-status");
+    if (statusElement) statusElement.textContent = "Checking local catalog candidates...";
+
+    let selectedIndex = 0;
+    let rerankerStatus = "unavailable";
+    try {
+      const response = await fetch("http://localhost:3001/rerank", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          transcript,
+          quantity,
+          namePart: parsed.words.join(" "),
+          strength: parsed.strength,
+          candidates: requestCandidates.map(({ index, code, name, strength }) => ({ index, code, name, strength }))
+        }),
+        signal: AbortSignal.timeout(CONFIG.rerankTimeoutMs)
+      });
+      const result = await response.json();
+      log("[VoicePOS] Catalog reranker endpoint response:", result);
+      rerankerStatus = response.ok ? result?.status || "invalid_response" : "unavailable";
+      if (response.ok && rerankerStatus === "ok" && Number.isInteger(result?.selectedIndex) &&
+          result.selectedIndex > 0 && result.selectedIndex <= requestCandidates.length) {
+        selectedIndex = result.selectedIndex;
+      } else if (rerankerStatus === "ok") rerankerStatus = "invalid_response";
+    } catch (error) {
+      rerankerStatus = ["TimeoutError", "AbortError"].includes(error?.name) ? "timeout" : "unavailable";
+      warn("Catalog reranker request failed; treating its result as uncertain:", error?.message || error);
+    }
+
+    const selected = selectedIndex > 0 ? requestCandidates[selectedIndex - 1]?.candidate || null : null;
+    if (!selected) throw new Error("Could not confidently identify the medicine.");
+    if (!candidateMatchesStrength(selected, productName)) {
+      log("[VoicePOS] Catalog reranker choice rejected by strength cross-check", { expected: parsed.strength, actual: productStrength(selected.name) });
+      throw new Error("Could not confidently identify the medicine.");
+    }
+    log(`[VoicePOS] Catalog reranker selected: ${selected.name} (candidate ${selectedIndex})`);
+    return selected;
+  }
+
   async function resolveVoiceCandidateAgreement({ deterministicMatch, candidates, transcript, productName, quantity }) {
     const parsed = extractSearchParts(productName);
     const discovered = candidates.filter(candidate => candidate?.name);
@@ -1021,6 +1563,65 @@ console.log("[VoicePOS] content script loaded");
     log("Temporary TEST ADD button mounted");
   }
 
+  function mountCatalogControls() {
+    if (document.querySelector(".voice-pos-catalog-panel")) return;
+    const panel = document.createElement("section");
+    panel.className = "voice-pos-catalog-panel";
+    panel.setAttribute("aria-label", "Catalog builder");
+
+    const build = document.createElement("button");
+    build.type = "button";
+    build.className = "voice-pos-catalog-build";
+    build.textContent = "Build catalog";
+    build.addEventListener("click", () => {
+      buildCatalog().catch(error => {
+        console.error("[VoicePOS] Catalog build failed:", error);
+        const status = document.querySelector(".voice-pos-catalog-status");
+        if (status) status.textContent = `Catalog build failed: ${error.message || error}`;
+        const buildButton = document.querySelector(".voice-pos-catalog-build");
+        const stopButton = document.querySelector(".voice-pos-catalog-stop");
+        if (buildButton) buildButton.disabled = false;
+        if (stopButton) stopButton.disabled = true;
+      });
+    });
+
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.className = "voice-pos-catalog-stop";
+    stop.textContent = "Stop";
+    stop.disabled = true;
+    stop.addEventListener("click", stopCatalogBuild);
+
+    const download = document.createElement("button");
+    download.type = "button";
+    download.className = "voice-pos-catalog-download";
+    download.textContent = "Download catalog.json";
+    download.addEventListener("click", downloadCatalog);
+
+    const importButton = document.createElement("button");
+    importButton.type = "button";
+    importButton.className = "voice-pos-catalog-import";
+    importButton.textContent = "Import catalog.json";
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/json,.json";
+    input.className = "voice-pos-catalog-file";
+    input.addEventListener("change", () => {
+      importCatalogFile(input.files?.[0]);
+      input.value = "";
+    });
+    importButton.addEventListener("click", () => input.click());
+
+    const status = document.createElement("div");
+    status.className = "voice-pos-catalog-status";
+    status.setAttribute("role", "status");
+    status.textContent = "Catalog idle";
+
+    panel.append(build, stop, download, importButton, input, status);
+    document.body.append(panel);
+    log("Catalog controls mounted");
+  }
+
   async function toggleRecording() {
     if (microphoneRequestPending) return;
     const micButton = document.querySelector(".voice-pos-mic");
@@ -1044,8 +1645,16 @@ console.log("[VoicePOS] content script loaded");
     if (status) status.textContent = "Requesting microphone access...";
     log("Requesting microphone");
     try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          noiseSuppression: true,
+          echoCancellation: true,
+          autoGainControl: true
+        }
+      });
+      const audioTrack = mediaStream.getAudioTracks()[0];
       log("Microphone granted");
+      if (audioTrack?.getSettings) log("Microphone audio settings:", audioTrack.getSettings());
       recordedChunks = [];
       if (lastRecordingUrl) URL.revokeObjectURL(lastRecordingUrl);
       lastRecordingUrl = null;
@@ -1184,9 +1793,18 @@ console.log("[VoicePOS] content script loaded");
         log(`Adding item ${index + 1}/${items.length}:`, `${item.product} × ${item.quantity}`);
         if (status) {
           status.className = "voice-pos-recording-status";
-          status.textContent = `Adding ${item.product} × ${item.quantity}...`;
+          status.textContent = `Matching ${item.product} × ${item.quantity} in local catalog...`;
         }
-        await addProduct(item.product, item.quantity, { voiceContext: { transcript } });
+        const resolvedCandidate = await resolveVoiceProductFromCatalog({
+          transcript,
+          productName: item.product,
+          quantity: item.quantity
+        });
+        if (status) {
+          status.className = "voice-pos-recording-status";
+          status.textContent = `Adding ${resolvedCandidate.name} × ${item.quantity}...`;
+        }
+        await addProductByResolvedCandidate(resolvedCandidate, item.quantity);
         log("Item added successfully", `${item.product} × ${item.quantity}`);
       }
       log("Voice order completed");
@@ -1238,8 +1856,21 @@ console.log("[VoicePOS] content script loaded");
     normalizePhoneticName,
     getPhoneticCodes,
     phoneticCodesMatch,
+    medicinePhoneticKey,
+    medicinePhoneticSimilarity,
     waitForElement,
     setNativeInputValue,
+    enrichCatalogItem,
+    upsertCatalogItems,
+    catalogSearchProductCards,
+    buildCatalog,
+    stopCatalogBuild,
+    downloadCatalog,
+    importCatalogFile,
+    getCartHasItems,
+    matchCatalogProduct,
+    resolveVoiceProductFromCatalog,
+    rerankCatalogCandidates,
     addProduct,
     addProductByResolvedCandidate,
     CONFIG
