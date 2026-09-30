@@ -36,10 +36,8 @@ console.log("[VoicePOS] content script loaded");
     catalogMinEmptyWaitMs: 3500,
     catalogSearchTimeout: 6000,
     catalogSettleMs: 600,
-    catalogMinPrefixLength: 2,
     catalogThrottleMinMs: 400,
     catalogThrottleMaxMs: 600,
-    catalogMaxPrefixDepth: 4,
     catalogRerankMaxCandidates: 8,
     rerankTimeoutMs: 10000,
     stageTimeout: 6000
@@ -50,7 +48,6 @@ console.log("[VoicePOS] content script loaded");
   let mediaStream = null;
   let recordedChunks = [];
   let microphoneRequestPending = false;
-  let lastRecordingUrl = null;
   let catalogHarvestRun = null;
 
   function log(...args) { console.info(LOG, ...args); }
@@ -666,16 +663,8 @@ console.log("[VoicePOS] content script loaded");
 
   function catalogSeedPrefixes() {
     const letters = "abcdefghijklmnopqrstuvwxyz".split("");
-    const minLength = Math.max(1, Number(CONFIG.catalogMinPrefixLength) || 2);
-    let prefixes = [""];
-    for (let depth = 0; depth < minLength; depth++) {
-      prefixes = prefixes.flatMap(prefix => letters.map(letter => `${prefix}${letter}`));
-    }
-    return prefixes;
-  }
-
-  function catalogChildPrefixes(prefix) {
-    return "abcdefghijklmnopqrstuvwxyz0123456789".split("").map(suffix => `${prefix}${suffix}`);
+    const twoLetterPrefixes = letters.flatMap(first => letters.map(second => `${first}${second}`));
+    return [...letters, ...twoLetterPrefixes];
   }
 
   function randomCatalogItems(items, count = 10) {
@@ -694,7 +683,7 @@ console.log("[VoicePOS] content script loaded");
     const section = document.createElement("section");
     section.className = "voice-pos-catalog-report";
     const summary = document.createElement("p");
-    summary.textContent = `Catalog: ${report.totalItems} items. Duplicates dropped: ${report.duplicatesDropped}. No strength: ${report.noStrengthCount}. Failed prefixes: ${report.failedPrefixes.length}. Zero-item prefixes: ${report.zeroItemQueries.length}. Capped at depth ${CONFIG.catalogMaxPrefixDepth}: ${report.cappedPrefixes.length}.`;
+    summary.textContent = `Catalog: ${report.totalItems} items. Duplicates dropped: ${report.duplicatesDropped}. No strength: ${report.noStrengthCount}. Failed searches: ${report.failedPrefixes.length}. Zero-item searches: ${report.zeroItemQueries.length}. Search prefixes: A-Z and AA-ZZ.`;
     const sample = document.createElement("pre");
     const zeroLines = report.zeroItemQueries.slice(0, 20)
       .map(item => `0 items | ${item.prefix} | ${item.waitedMs}ms | ${item.state}`)
@@ -723,12 +712,9 @@ console.log("[VoicePOS] content script loaded");
     if (stopButton) stopButton.disabled = false;
 
     const queue = catalogSeedPrefixes();
-    const seenPrefixes = new Set(queue);
     const itemsByCode = new Map();
     const failedPrefixes = [];
-    const cappedPrefixes = [];
     const zeroItemQueries = [];
-    let observedCap = 0;
     let queriesDone = 0;
     let duplicatesDropped = 0;
     let previousSignature = "";
@@ -792,20 +778,6 @@ console.log("[VoicePOS] content script loaded");
           itemsByCode.set(item.code, item);
         }
 
-        const resultCount = result.cards.length;
-        observedCap = Math.max(observedCap, resultCount);
-        const looksCapped = observedCap > 0 && resultCount >= observedCap;
-        if (looksCapped) {
-          if (prefix.length >= CONFIG.catalogMaxPrefixDepth) cappedPrefixes.push(prefix);
-          else {
-            for (const child of catalogChildPrefixes(prefix)) {
-              if (!seenPrefixes.has(child)) {
-                seenPrefixes.add(child);
-                queue.push(child);
-              }
-            }
-          }
-        }
         updateProgress();
       }
 
@@ -815,7 +787,6 @@ console.log("[VoicePOS] content script loaded");
         duplicatesDropped,
         noStrengthCount: items.filter(item => !item.strength).length,
         failedPrefixes,
-        cappedPrefixes,
         zeroItemQueries,
         sampleItems: randomCatalogItems(items, 10)
       };
@@ -1113,7 +1084,7 @@ console.log("[VoicePOS] content script loaded");
           found.add(el);
           if (el.nextElementSibling) found.add(el.nextElementSibling);
           if (el.parentElement) found.add(el.parentElement);
-        } else if (/^\d+(?:\.\d+)?$/.test(text) && el.children.length === 0) found.add(el);
+        }
       }
       return [...found].filter(isVisible);
     };
@@ -1168,7 +1139,7 @@ console.log("[VoicePOS] content script loaded");
     logQuantityCandidates("After Q click");
 
     const initial = snapshot();
-    if (initial.quantities.some(matchesQty)) log("[VoicePOS] Quantity already shows requested value", quantity);
+    if (readNumericQuantity() === quantity) log("[VoicePOS] Quantity already shows requested value", quantity);
     else {
       for (const digit of String(quantity)) {
         log(`[VoicePOS] Looking for digit ${digit}`);
@@ -1565,14 +1536,23 @@ console.log("[VoicePOS] content script loaded");
 
   function mountCatalogControls() {
     if (document.querySelector(".voice-pos-catalog-panel")) return;
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "voice-pos-catalog-toggle";
+    toggle.textContent = "Catalog";
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.setAttribute("aria-controls", "voice-pos-catalog-panel");
+
     const panel = document.createElement("section");
+    panel.id = "voice-pos-catalog-panel";
     panel.className = "voice-pos-catalog-panel";
+    panel.hidden = true;
     panel.setAttribute("aria-label", "Catalog builder");
 
     const build = document.createElement("button");
     build.type = "button";
     build.className = "voice-pos-catalog-build";
-    build.textContent = "Build catalog";
+    build.textContent = "Start catalog scan";
     build.addEventListener("click", () => {
       buildCatalog().catch(error => {
         console.error("[VoicePOS] Catalog build failed:", error);
@@ -1588,14 +1568,14 @@ console.log("[VoicePOS] content script loaded");
     const stop = document.createElement("button");
     stop.type = "button";
     stop.className = "voice-pos-catalog-stop";
-    stop.textContent = "Stop";
+    stop.textContent = "Stop scan";
     stop.disabled = true;
     stop.addEventListener("click", stopCatalogBuild);
 
     const download = document.createElement("button");
     download.type = "button";
     download.className = "voice-pos-catalog-download";
-    download.textContent = "Download catalog.json";
+    download.textContent = "Save catalog.json";
     download.addEventListener("click", downloadCatalog);
 
     const importButton = document.createElement("button");
@@ -1617,9 +1597,42 @@ console.log("[VoicePOS] content script loaded");
     status.setAttribute("role", "status");
     status.textContent = "Catalog idle";
 
+    toggle.addEventListener("click", () => {
+      const nextHidden = !panel.hidden;
+      panel.hidden = nextHidden;
+      toggle.setAttribute("aria-expanded", String(!nextHidden));
+    });
+
     panel.append(build, stop, download, importButton, input, status);
+    document.body.append(toggle);
     document.body.append(panel);
-    log("Catalog controls mounted");
+    log("Catalog launcher mounted");
+  }
+
+  function microphoneStreamIsActive() {
+    return !!mediaStream && mediaStream.getAudioTracks().some(track => track.readyState === "live");
+  }
+
+  async function ensureMicrophoneStream() {
+    if (microphoneStreamIsActive()) return mediaStream;
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        noiseSuppression: true,
+        echoCancellation: true,
+        autoGainControl: true
+      }
+    });
+    for (const track of mediaStream.getTracks()) {
+      track.addEventListener?.("ended", () => {
+        if (!microphoneStreamIsActive()) {
+          mediaStream = null;
+          resetMicButton();
+          const status = document.querySelector(".voice-pos-recording-status");
+          if (status) status.textContent = "Microphone disconnected. Click Speak order to reconnect.";
+        }
+      }, { once: true });
+    }
+    return mediaStream;
   }
 
   async function toggleRecording() {
@@ -1645,23 +1658,14 @@ console.log("[VoicePOS] content script loaded");
     if (status) status.textContent = "Requesting microphone access...";
     log("Requesting microphone");
     try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          noiseSuppression: true,
-          echoCancellation: true,
-          autoGainControl: true
-        }
-      });
-      const audioTrack = mediaStream.getAudioTracks()[0];
-      log("Microphone granted");
+      const stream = await ensureMicrophoneStream();
+      const audioTrack = stream.getAudioTracks()[0];
+      log("Microphone ready");
       if (audioTrack?.getSettings) log("Microphone audio settings:", audioTrack.getSettings());
       recordedChunks = [];
-      if (lastRecordingUrl) URL.revokeObjectURL(lastRecordingUrl);
-      lastRecordingUrl = null;
-      document.querySelector(".voice-pos-play-recording")?.remove();
       const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"]
         .find(type => MediaRecorder.isTypeSupported?.(type));
-      mediaRecorder = mimeType ? new MediaRecorder(mediaStream, { mimeType }) : new MediaRecorder(mediaStream);
+      mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
       mediaRecorder.addEventListener("dataavailable", event => {
         if (!event.data || event.data.size === 0) return;
         recordedChunks.push(event.data);
@@ -1671,17 +1675,17 @@ console.log("[VoicePOS] content script loaded");
         const error = event.error || event;
         console.error("[VoicePOS] Recording error:", error);
         if (status) status.textContent = `Recording failed: ${error.message || error.name || "unknown error"}`;
-        stopMicrophoneTracks();
+        mediaRecorder = null;
         resetMicButton();
       });
       mediaRecorder.addEventListener("stop", async () => {
         log("Recording stopped");
-        stopMicrophoneTracks();
-        const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || "audio/webm" });
+        const recorderMimeType = mediaRecorder?.mimeType || "audio/webm";
+        mediaRecorder = null;
+        const blob = new Blob(recordedChunks, { type: recorderMimeType });
         log("Audio blob created:", blob.size, "bytes");
         log("Audio size:", blob.size);
         if (blob.size > 0) {
-          addPlaybackButton(blob);
           await transcribeRecording(blob);
         } else {
           const message = "No audio data was recorded. Check microphone input and try again.";
@@ -1702,7 +1706,7 @@ console.log("[VoicePOS] content script loaded");
       }
       if (status) {
         status.className = "voice-pos-recording-status";
-        status.textContent = "Listening...";
+        status.textContent = "Recording this order. Audio is sent only after you stop.";
       }
     } catch (error) {
       stopMicrophoneTracks();
@@ -1723,6 +1727,9 @@ console.log("[VoicePOS] content script loaded");
     if (!mediaStream) return;
     for (const track of mediaStream.getTracks()) track.stop();
     mediaStream = null;
+    mediaRecorder = null;
+    const status = document.querySelector(".voice-pos-recording-status");
+    if (status) status.textContent = "Microphone off.";
   }
 
   function resetMicButton() {
@@ -1730,26 +1737,16 @@ console.log("[VoicePOS] content script loaded");
     if (!button) return;
     button.disabled = false;
     button.textContent = "🎙 Speak order";
-    button.setAttribute("aria-label", "Start or stop audio recording");
-  }
-
-  function addPlaybackButton(blob) {
-    document.querySelector(".voice-pos-play-recording")?.remove();
-    lastRecordingUrl = URL.createObjectURL(blob);
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "voice-pos-play-recording";
-    button.textContent = "PLAY RECORDING";
-    button.title = `Play captured audio (${blob.size} bytes)`;
-    button.addEventListener("click", async () => {
-      try { await new Audio(lastRecordingUrl).play(); }
-      catch (error) {
-        console.error("[VoicePOS] Playback error:", error);
-        const status = document.querySelector(".voice-pos-recording-status");
-        if (status) status.textContent = `Could not play recording: ${error.message || error}`;
-      }
-    });
-    document.body.append(button);
+    button.setAttribute("aria-label", microphoneStreamIsActive()
+      ? "Record one order using the ready microphone"
+      : "Start microphone and record one order");
+    const release = document.querySelector(".voice-pos-release-mic");
+    if (release) release.hidden = !microphoneStreamIsActive();
+    const status = document.querySelector(".voice-pos-recording-status");
+    if (status && microphoneStreamIsActive() && !status.textContent) {
+      status.className = "voice-pos-recording-status";
+      status.textContent = "Mic ready. Audio is sent only while recording.";
+    }
   }
 
   async function transcribeRecording(blob) {
@@ -1820,6 +1817,13 @@ console.log("[VoicePOS] content script loaded");
       }
     } finally {
       resetMicButton();
+      if (status && microphoneStreamIsActive() && status.classList?.contains("voice-pos-success")) {
+        setTimeout(() => {
+          if (!microphoneStreamIsActive() || mediaRecorder?.state === "recording") return;
+          status.className = "voice-pos-recording-status";
+          status.textContent = "Mic ready. Audio is sent only while recording.";
+        }, 1800);
+      }
     }
   }
 
@@ -1829,9 +1833,20 @@ console.log("[VoicePOS] content script loaded");
     button.type = "button";
     button.className = "voice-pos-mic";
     button.textContent = "🎙 Speak order";
-    button.setAttribute("aria-label", "Start or stop audio recording");
+    button.setAttribute("aria-label", "Start microphone and record one order");
     button.addEventListener("click", toggleRecording);
     document.body.append(button);
+    const release = document.createElement("button");
+    release.type = "button";
+    release.className = "voice-pos-release-mic";
+    release.textContent = "Release mic";
+    release.hidden = true;
+    release.addEventListener("click", () => {
+      if (mediaRecorder?.state === "recording") mediaRecorder.stop();
+      stopMicrophoneTracks();
+      resetMicButton();
+    });
+    document.body.append(release);
     const status = document.createElement("div");
     status.className = "voice-pos-recording-status";
     status.setAttribute("role", "status");
@@ -1862,6 +1877,7 @@ console.log("[VoicePOS] content script loaded");
     setNativeInputValue,
     enrichCatalogItem,
     upsertCatalogItems,
+    catalogSeedPrefixes,
     catalogSearchProductCards,
     buildCatalog,
     stopCatalogBuild,
@@ -1880,6 +1896,7 @@ console.log("[VoicePOS] content script loaded");
   function mountDevelopmentControls() {
     mountMicButton();
     mountTestAddButton();
+    mountCatalogControls();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", mountDevelopmentControls, { once: true });
   else mountDevelopmentControls();

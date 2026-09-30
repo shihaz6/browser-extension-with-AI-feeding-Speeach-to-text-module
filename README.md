@@ -43,7 +43,7 @@ The voice grammar is `[quantity] [product name] [strength/size]`, such as `10 At
 11. Click **Speak order** and allow microphone access if prompted.
 12. Speak the product order, then click the microphone button again to stop recording.
 13. Confirm the console logs a nonzero audio size and **Sending audio for transcription**.
-14. Verify `[VoicePOS] Transcript received: ...` and parsed item logs in the console. **PLAY RECORDING** remains available during development.
+14. Verify `[VoicePOS] Transcript received: ...` and parsed item logs in the console.
 15. Items are processed sequentially. Agreement between deterministic matching and the reranker adds automatically. Disagreement shows both answers and requires a human choice or Cancel. Parse and search failures stop the order.
 
 ## Local transcription backend
@@ -61,6 +61,8 @@ The backend's Groq transcription adapter calls `https://api.groq.com/openai/v1/a
 ## Manual workflow check
 
 The temporary **TEST ADD** button runs `addProduct("Losacar 50mg", 10)` inside the content script. It is not exposed as a page-console function because Chrome content scripts use an isolated world. Review `[VoicePOS]` logs for each stage, plus the test started/completed/failed message. The microphone button starts MediaRecorder on the first click and stops it on the second. It posts a nonempty Blob to the local backend; a successful transcript with complete quantities is added sequentially. The small status notification shows listening, transcription, adding, success, or an error. Checkout/payment is not automated.
+
+The **Build catalog** control imports products from POS search results using fixed prefix searches only: `a` through `z`, then `aa` through `zz`. It does not recurse beyond two letters. The builder still refuses to run when the cart/bill has items, throttles each search, deduplicates by product code, and stores the imported catalog in `chrome.storage.local`.
 
 ## Limitations
 
