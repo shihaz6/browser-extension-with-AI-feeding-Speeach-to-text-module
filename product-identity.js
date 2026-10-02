@@ -9,6 +9,7 @@
       .replace(/\bmilligram(?:me)?s?\b/g, 'mg')
       .replace(/\bmillilit(?:er|re)s?\b/g, 'ml')
       .replace(/\bmicrograms?\b/g, 'mcg')
+      .replace(/\b(?:grams?|grammes?|gms?)\b/g, 'g')
       .replace(/μg|µg/g, 'mcg')
       .replace(/(?<=\d)\s*(milligram(?:me)?s?|millilit(?:er|re)s?)/g, unit => unit.trim().startsWith('millil') ? 'ml' : 'mg')
       .replace(/(?<![a-z0-9])\.(?=\d)/g, '0.')
@@ -44,10 +45,21 @@
     const right = extract(candidate);
     if (!left.valid || !right.valid) return false;
     if (!left.components.length) return true;
+    if (omittedTopicalConcentrationMatches(left, right)) return true;
     return left.components.length === right.components.length &&
       left.connectors.join('') === right.connectors.join('') &&
       left.components.every((part, index) => part.value === right.components[index].value &&
         (!part.unit || part.unit === right.components[index].unit));
+  }
+  function omittedTopicalConcentrationMatches(queryParts, candidateParts) {
+    if (!/\b(?:cream|gel|ointment|oinment|lotion|solution|spray|drops?)\b/.test(queryParts.namePart)) return false;
+    if (queryParts.namePart !== candidateParts.namePart) return false;
+    if (queryParts.components.length !== 1 || candidateParts.components.length < 2) return false;
+    const requestedPack = queryParts.components[0];
+    if (!['g', 'ml'].includes(requestedPack.unit)) return false;
+    const candidateHasConcentration = candidateParts.components.slice(0, -1).some(part => part.unit === '%');
+    const candidatePack = candidateParts.components[candidateParts.components.length - 1];
+    return candidateHasConcentration && candidatePack.value === requestedPack.value && candidatePack.unit === requestedPack.unit;
   }
   return Object.freeze({ normalize, extract, strengthMatches });
 });

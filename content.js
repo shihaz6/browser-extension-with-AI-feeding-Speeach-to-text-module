@@ -191,6 +191,35 @@ console.log("[VoicePOS] content script loaded");
     return new Promise(resolve => getCatalog(resolve));
   }
 
+  function normalizeCatalogPayload(raw) {
+    const sourceItems = Array.isArray(raw?.items) ? raw.items : [];
+    const byKey = new Map();
+    for (const rawItem of sourceItems) {
+      const item = enrichCatalogItem(rawItem, rawItem?.discoveredFromPrefix || "bundled");
+      if (!item.code || !item.name) continue;
+      byKey.set(catalogItemKey(item), item);
+    }
+    return {
+      harvestedAt: raw?.harvestedAt || new Date().toISOString(),
+      items: [...byKey.values()]
+    };
+  }
+
+  async function loadBundledCatalog() {
+    if (!globalThis.chrome?.runtime?.getURL || typeof fetch !== "function") return { harvestedAt: "", items: [] };
+    const response = await fetch(chrome.runtime.getURL("pos_catalog.json"), { cache: "no-store" });
+    if (!response.ok) throw new Error(`Bundled catalog failed to load (HTTP ${response.status})`);
+    return normalizeCatalogPayload(await response.json());
+  }
+
+  async function getCatalogWithBundledFallback() {
+    const catalog = await getCatalogAsync();
+    if (Array.isArray(catalog.items) && catalog.items.length) return catalog;
+    const bundled = await loadBundledCatalog();
+    if (bundled.items.length) await new Promise(resolve => saveCatalog(bundled, resolve));
+    return bundled;
+  }
+
   function saveCatalog(catalog, callback = () => {}) {
     const payload = {
       harvestedAt: catalog.harvestedAt || new Date().toISOString(),
@@ -1244,9 +1273,9 @@ console.log("[VoicePOS] content script loaded");
   }
 
   async function resolveVoiceProductFromCatalog({ transcript, productName, quantity }) {
-    const catalog = await getCatalogAsync();
+    const catalog = await getCatalogWithBundledFallback();
     const items = Array.isArray(catalog.items) ? catalog.items : [];
-    if (!items.length) throw new Error("Local catalog is empty. Build or import catalog.json before using voice orders.");
+    if (!items.length) throw new Error("Local catalog is empty. Build, import, or reload the bundled pos_catalog.json before using voice orders.");
     const { match } = matchCatalogProduct(productName, items);
     if (match?.product) {
       log(`[VoicePOS] Catalog deterministic result: ${match.product.name} (${Number(match.score).toFixed(2)})`);
@@ -1876,6 +1905,8 @@ console.log("[VoicePOS] content script loaded");
     waitForElement,
     setNativeInputValue,
     enrichCatalogItem,
+    loadBundledCatalog,
+    getCatalogWithBundledFallback,
     upsertCatalogItems,
     catalogSeedPrefixes,
     catalogSearchProductCards,
