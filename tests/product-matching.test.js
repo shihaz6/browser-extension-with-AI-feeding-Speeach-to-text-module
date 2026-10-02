@@ -119,6 +119,25 @@ test('plural tens STT token is accepted as quantity ten', () => {
   assert.equal(item.needsCorrection, false);
 });
 
+test('spoken grams normalize to g for quantity-first orders', () => {
+  const [item] = voicePOS.parseOrder('7 Loseryl Cream 30 grams.');
+  assert.equal(item.quantity, 7);
+  assert.equal(item.product, 'loseryl cream 30 grams');
+  assert.equal(item.needsCorrection, false);
+});
+
+test('topical concentration may be omitted when name form and pack size match', () => {
+  const result = voicePOS.findBestProductMatch('Loceryl Cream 30 grams', ['Loceryl Cream 0.25% 30g']);
+  assert.equal(result.strengthMatch, true);
+  assert.equal(result.confident, true);
+});
+
+test('omitted topical concentration does not override wrong pack size', () => {
+  const result = voicePOS.findBestProductMatch('Loceryl Cream 10g', ['Loceryl Cream 0.25% 30g']);
+  assert.equal(result.strengthMatch, false);
+  assert.equal(result.confident, false);
+});
+
 for (const [query, candidate] of [
   ['Sample 5ml', 'Sample 50ml'], ['Sample 2.5mg', 'Sample 2mg'],
   ['Sample 50mg', 'Sample 50mg/12.5mg'], ['Sample 5mg', 'Sample 5ml'],

@@ -14,9 +14,6 @@ function resolveSelection(raw, candidates) {
   if (!Number.isSafeInteger(index)) return { selectedIndex: 0, valid: false, selectedBy: "invalid" };
   if (index === 0) return { selectedIndex: 0, valid: true, selectedBy: "uncertain" };
   if (index <= candidates.length) return { selectedIndex: index, valid: true, selectedBy: "index" };
-
-  const matchingCodes = candidates.filter(candidate => String(candidate.code || "").trim() === value);
-  if (matchingCodes.length === 1) return { selectedIndex: matchingCodes[0].index, valid: true, selectedBy: "code" };
   return { selectedIndex: 0, valid: false, selectedBy: "invalid" };
 }
 
@@ -50,6 +47,7 @@ Examples of this type of match, only when the named medicine is present in the c
 - "zaat", "zaart", or "zart" may refer to "Zart"
 
 Consider medicine brand names, generic names, common pharmacy suffixes/prefixes, dosage strengths such as mg, mcg, g, ml, %, and IU, and product forms such as tablet, capsule, syrup, cream, or drops when present.
+For topical products such as creams, gels, ointments, lotions, solutions, sprays, or drops, a spoken phrase may omit a concentration percentage. If the spoken brand/form and pack size strongly match a candidate such as "Loceryl Cream 0.25% 30g", it may match "Loceryl Cream 30g". Do not apply this to wrong pack sizes or weak name matches.
 
 IMPORTANT:
 - The candidates below are real products in this pharmacy POS.

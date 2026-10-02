@@ -27,6 +27,17 @@ app.use(express.json({ limit: "128kb" }));
 
 app.get("/health", (_request, response) => response.json({ ok: true }));
 
+function audioDiagnostics(originalFile, audioFile, preprocessStatus) {
+  return {
+    status: preprocessStatus,
+    profile: audioFile.preprocessingProfile || "none",
+    originalBytes: originalFile.size || originalFile.buffer?.length || 0,
+    processedBytes: audioFile.size || audioFile.buffer?.length || 0,
+    originalMimeType: originalFile.mimetype || "unknown",
+    processedMimeType: audioFile.mimetype || "unknown"
+  };
+}
+
 app.post("/transcribe", upload.single("audio"), async (request, response) => {
   if (!request.file || request.file.size === 0) {
     return response.status(400).json({ error: "Upload a non-empty audio file in multipart field 'audio'." });
@@ -38,14 +49,17 @@ app.post("/transcribe", upload.single("audio"), async (request, response) => {
     try {
       audioFile = await preprocessAudio(request.file);
       audioPreprocess = audioFile.preprocessing || "cleaned";
-      console.info("[VoicePOS server] Audio preprocessing:", audioPreprocess, `${request.file.size} -> ${audioFile.size} bytes`);
+      console.info("[VoicePOS server] Audio preprocessing:", audioDiagnostics(request.file, audioFile, audioPreprocess));
     } catch (preprocessError) {
       audioPreprocess = "fallback_original";
-      console.warn("[VoicePOS server] Audio preprocessing failed; using original audio:", preprocessError.message);
+      console.warn("[VoicePOS server] Audio preprocessing failed; using original audio:", {
+        ...audioDiagnostics(request.file, request.file, audioPreprocess),
+        error: preprocessError.message
+      });
     }
 
     const text = await transcribeAudio(audioFile);
-    return response.json({ text, audioPreprocess });
+    return response.json({ text, audioPreprocess, audioDiagnostics: audioDiagnostics(request.file, audioFile, audioPreprocess) });
   } catch (error) {
     const status = Number.isInteger(error.statusCode) ? error.statusCode : 502;
     console.error("[VoicePOS server] Transcription failed:", error.message);

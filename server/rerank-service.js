@@ -25,7 +25,7 @@ async function evaluateRerank(body, provider = rerankProducts, logger = console)
     if (!Number.isSafeInteger(result.selectedIndex) || result.selectedIndex < 1 || result.selectedIndex > candidates.length) {
       return { selectedIndex: 0, status: 'invalid_response' };
     }
-    if (!identity.strengthMatches(body.strength, candidates[result.selectedIndex - 1].name)) {
+    if (!identity.strengthMatches(`${body.namePart} ${body.strength}`.trim(), candidates[result.selectedIndex - 1].name)) {
       return { selectedIndex: 0, status: 'strength_rejected' };
     }
     return { selectedIndex: result.selectedIndex, status: 'ok' };

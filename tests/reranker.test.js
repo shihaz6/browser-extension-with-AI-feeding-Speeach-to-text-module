@@ -46,17 +46,17 @@ test('prompt frames reranking as pharmacy catalog-only medicine resolution', asy
   assert.match(prompt, /Do NOT return the POS_CODE/i);
   assert.match(prompt, /Return ONLY the OPTION_INDEX, or 0/i);
 });
-test('exact candidate code can be resolved back to its candidate index', async () => {
+test('candidate POS code is rejected because only option indexes are valid', async () => {
   const result = await rerank(input, options('101'));
-  assert.equal(result.selectedIndex, 1);
-  assert.equal(result.status, 'ok');
-  assert.equal(result.selectedBy, 'code');
+  assert.equal(result.selectedIndex, 0);
+  assert.equal(result.status, 'invalid_response');
+  assert.equal(result.selectedBy, 'invalid');
 });
-test('candidate code selection must uniquely match a provided candidate', () => {
+test('candidate POS code is not accepted by resolveSelection', () => {
   assert.deepEqual(resolveSelection('23799', [
     { index: 1, code: '23799', name: 'Losacar 50mg' },
     { index: 2, code: '555', name: 'Losacar 25mg' }
-  ]), { selectedIndex: 1, valid: true, selectedBy: 'code' });
+  ]), { selectedIndex: 0, valid: false, selectedBy: 'invalid' });
   assert.deepEqual(resolveSelection('23799', [
     { index: 1, code: '23799', name: 'Losacar 50mg' },
     { index: 2, code: '23799', name: 'Different duplicate code' }
@@ -88,6 +88,17 @@ test('backend enforces decimal, unit, and combination gates', async () => {
     const request = { ...input, strength, candidates: [{ index: 1, code: '1', name, strength }] };
     assert.equal((await evaluateRerank(request, async () => ({ status: 'ok', selectedIndex: 1 }), logger)).status, 'strength_rejected');
   }
+});
+test('backend allows omitted topical concentration when pack size matches', async () => {
+  const request = {
+    transcript: '7 Loseryl Cream 30 grams',
+    quantity: 7,
+    namePart: 'loceryl cream',
+    strength: '30g',
+    candidates: [{ index: 1, code: '23568', name: 'Loceryl Cream 0.25% 30g', strength: '0.25%+30g' }]
+  };
+  const result = await evaluateRerank(request, async () => ({ status: 'ok', selectedIndex: 1 }), logger);
+  assert.deepEqual(result, { selectedIndex: 1, status: 'ok' });
 });
 test('backend preserves the complete discovered candidate list', async () => {
   const candidates = Array.from({ length: 12 }, (_, i) => ({ index: i + 1, code: String(i), name: `Sample ${20 + i}mg` }));

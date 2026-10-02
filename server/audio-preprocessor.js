@@ -6,12 +6,15 @@ const path = require("path");
 const ffmpegPath = require("ffmpeg-static");
 
 const AUDIO_FILTERS = [
-  "highpass=f=80",
-  "lowpass=f=8000",
-  "afftdn",
+  "highpass=f=120",
+  "lowpass=f=4500",
+  "afftdn=nf=-25",
+  "acompressor=threshold=-22dB:ratio=2:attack=8:release=120:makeup=2dB",
   "loudnorm=I=-18:TP=-2:LRA=11",
   "aformat=sample_fmts=s16:sample_rates=16000:channel_layouts=mono"
 ].join(",");
+
+const AUDIO_PROFILE = "pharmacy_speech_v1";
 
 function extensionFor(file) {
   const mime = String(file?.mimetype || "").split(";")[0].toLowerCase();
@@ -66,11 +69,13 @@ async function preprocessAudio(file) {
       size: buffer.length,
       mimetype: "audio/wav",
       originalname: "voice-order-cleaned.wav",
-      preprocessing: "cleaned"
+      preprocessing: "cleaned",
+      preprocessingProfile: AUDIO_PROFILE,
+      preprocessingFilters: AUDIO_FILTERS
     };
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-module.exports = { preprocessAudio };
+module.exports = { preprocessAudio, AUDIO_FILTERS, AUDIO_PROFILE };
